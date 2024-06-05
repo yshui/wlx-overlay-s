@@ -23,14 +23,19 @@ use wlx_capture::{
 #[cfg(feature = "wayland")]
 use {
     crate::config::AStrMapExt,
-    crate::config_io,
-    std::{error::Error, ops::Deref, path::PathBuf},
     wlx_capture::{
-        pipewire::{pipewire_select_screen, PipewireCapture},
         wayland::{wayland_client::protocol::wl_output, WlxClient, WlxOutput},
         wlr_dmabuf::WlrDmabufCapture,
         wlr_screencopy::WlrScreencopyCapture,
     },
+};
+
+#[cfg(any(feature = "wayland", feature = "x11"))]
+use {
+    crate::config_io,
+    std::error::Error,
+    std::{ops::Deref, path::PathBuf},
+    wlx_capture::pipewire::{pipewire_select_screen, PipewireCapture, PipewireStream},
 };
 
 #[cfg(feature = "x11")]
@@ -58,6 +63,34 @@ pub(crate) type WlxClientAlias = ();
 const CURSOR_SIZE: f32 = 16. / 1440.;
 
 static DRM_FORMATS: once_cell::sync::OnceCell<Vec<DrmFormat>> = once_cell::sync::OnceCell::new();
+
+#[cfg(any(feature = "wayland", feature = "x11"))]
+fn best_match<'a>(
+    stream: &PipewireStream,
+    mut streams: impl Iterator<Item = &'a XshmScreen>,
+) -> Option<&'a XshmScreen> {
+    let mut best = streams.next();
+    log::info!("stream: {:?}", stream.position);
+    log::info!("first: {:?}", best.map(|b| &b.monitor));
+    let Some(position) = stream.position else {
+        return best;
+    };
+
+    let mut best_dist = best
+        .map(|b| (b.monitor.x() - position.0).abs() + (b.monitor.y() - position.1).abs())
+        .unwrap_or(i32::MAX);
+    for stream in streams {
+        log::info!("checking: {:?}", stream.monitor);
+        let dist =
+            (stream.monitor.x() - position.0).abs() + (stream.monitor.y() - position.1).abs();
+        if dist < best_dist {
+            best = Some(stream);
+            best_dist = dist;
+        }
+    }
+    log::info!("best: {:?}", best.map(|b| &b.monitor));
+    best
+}
 
 pub struct ScreenInteractionHandler {
     next_scroll: Instant,
@@ -635,14 +668,14 @@ pub struct TokenConf {
     pub pw_tokens: PwTokenMap,
 }
 
-#[cfg(feature = "wayland")]
+#[cfg(any(feature = "wayland", feature = "x11"))]
 fn get_pw_token_path() -> PathBuf {
     let mut path = config_io::get_conf_d_path();
     path.push("pw_tokens.yaml");
     path
 }
 
-#[cfg(feature = "wayland")]
+#[cfg(any(feature = "wayland", feature = "x11"))]
 pub fn save_pw_token_config(tokens: PwTokenMap) -> Result<(), Box<dyn Error>> {
     let conf = TokenConf { pw_tokens: tokens };
     let yaml = serde_yaml::to_string(&conf)?;
@@ -651,7 +684,7 @@ pub fn save_pw_token_config(tokens: PwTokenMap) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[cfg(feature = "wayland")]
+#[cfg(any(feature = "wayland", feature = "x11"))]
 pub fn load_pw_token_config() -> Result<PwTokenMap, Box<dyn Error>> {
     let yaml = std::fs::read_to_string(get_pw_token_path())?;
     let conf: TokenConf = serde_yaml::from_str(yaml.as_str())?;
@@ -756,9 +789,25 @@ pub fn create_screens_x11(_app: &mut AppState) -> anyhow::Result<ScreenCreateDat
 
 #[cfg(feature = "x11")]
 pub fn create_screens_x11(app: &mut AppState) -> anyhow::Result<ScreenCreateData> {
+    use crate::config::{AStrMap, AStrMapExt};
     use anyhow::bail;
 
-    let mut extent = vec2(0., 0.);
+    log::info!("Creating X11 screens");
+    // Load existing Pipewire tokens from file
+    let mut pw_tokens: PwTokenMap = if let Ok(conf) = load_pw_token_config() {
+        conf
+    } else {
+        AStrMap::new()
+    };
+    let token = pw_tokens.arc_get("x11").map(|s| s.as_str());
+    let embed_mouse = !app.session.config.double_cursor_fix;
+    let select_screen_result =
+        futures::executor::block_on(pipewire_select_screen(token, embed_mouse, true, true, true))?;
+    if let Some(restore_token) = select_screen_result.restore_token {
+        if pw_tokens.arc_ins("x11".into(), restore_token.clone()) {
+            log::info!("Adding Pipewire token {}", restore_token);
+        }
+    }
 
     let monitors = match XshmCapture::get_monitors() {
         Ok(m) => m,
@@ -766,36 +815,41 @@ pub fn create_screens_x11(app: &mut AppState) -> anyhow::Result<ScreenCreateData
             bail!(e.to_string());
         }
     };
+    log::info!("Got {} monitors", monitors.len());
+    log::info!("Got {} streams", select_screen_result.streams.len());
 
-    let screens = monitors
+    let mut extent = vec2(0., 0.);
+    let screens = select_screen_result
+        .streams
         .into_iter()
-        .map(|s| {
-            extent.x = extent.x.max((s.monitor.x() + s.monitor.width()) as f32);
-            extent.y = extent.y.max((s.monitor.y() + s.monitor.height()) as f32);
+        .enumerate()
+        .map(|(i, s)| {
+            let m = best_match(&s, monitors.iter().map(AsRef::as_ref)).unwrap();
+            log::info!("Stream {i} is {}", m.name);
+            extent.x = extent.x.max((m.monitor.x() + m.monitor.width()) as f32);
+            extent.y = extent.y.max((m.monitor.y() + m.monitor.height()) as f32);
 
-            let size = (s.monitor.width(), s.monitor.height());
-            let pos = (s.monitor.x(), s.monitor.y());
-            let renderer = ScreenRenderer::new_xshm(s.clone());
-
-            log::info!(
-                "{}: Init X11 screen of res {:?} at {:?}",
-                s.name.clone(),
-                size,
-                pos,
-            );
-
+            let size = (m.monitor.width(), m.monitor.height());
             let interaction = create_screen_interaction(
-                vec2(s.monitor.x() as f32, s.monitor.y() as f32),
-                vec2(size.0 as f32, size.1 as f32),
+                vec2(m.monitor.x() as f32, m.monitor.y() as f32),
+                vec2(m.monitor.width() as f32, m.monitor.height() as f32),
                 Transform::Normal,
             );
 
-            let state = create_screen_state(s.name.clone(), size, Transform::Normal, &app.session);
+            let state = create_screen_state(m.name.clone(), size, Transform::Normal, &app.session);
 
             let meta = ScreenMeta {
-                name: s.name.clone(),
+                name: m.name.clone(),
                 id: state.id,
                 native_handle: 0,
+            };
+
+            let renderer = ScreenRenderer {
+                name: m.name.clone(),
+                capture: Box::new(PipewireCapture::new(m.name.clone(), s.node_id, 60)),
+                pipeline: None,
+                last_view: None,
+                extent: extent_from_res(size),
             };
 
             let backend = Box::new(SplitOverlayBackend {
